@@ -2,6 +2,7 @@ package docker
 
 import (
 	"math"
+	"strings"
 
 	"github.com/docker/docker/api/types/container"
 )
@@ -59,6 +60,8 @@ func networkTotals(s *container.StatsResponse) (rx, tx int64) {
 }
 
 // blkioTotals sums read/write bytes from blkio stats (cgroup v1; v2 maps here too).
+// Op matching is case-insensitive: cgroup v1 sends "Read"/"Write" but some
+// runtime/cgroup v2 translation layers may send lowercase variants.
 func blkioTotals(s *container.StatsResponse) (read, write int64, ok bool) {
 	entries := s.BlkioStats.IoServiceBytesRecursive
 	if len(entries) == 0 {
@@ -66,10 +69,10 @@ func blkioTotals(s *container.StatsResponse) (read, write int64, ok bool) {
 	}
 	ok = true
 	for _, e := range entries {
-		switch e.Op {
-		case "Read":
+		switch strings.ToLower(e.Op) {
+		case "read":
 			read += int64(e.Value)
-		case "Write":
+		case "write":
 			write += int64(e.Value)
 		}
 	}

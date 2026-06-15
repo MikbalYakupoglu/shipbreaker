@@ -62,6 +62,11 @@ type Watcher struct {
 	statsCache   map[string]*container.StatsResponse // latest frame from stream
 	streamCancel map[string]context.CancelFunc        // per-container stream lifecycle
 	intervalCh   chan time.Duration
+	triggerCh    chan chan struct{} // force-poll requests; caller provides a done channel
+
+	// one-shot warning flags; only accessed from the single-goroutine poll path
+	warnedNoNet  map[string]bool
+	warnedNoDisk map[string]bool
 }
 
 func New(cli *client.Client, sink Sink, interval time.Duration, log *slog.Logger) *Watcher {
@@ -74,6 +79,25 @@ func New(cli *client.Client, sink Sink, interval time.Duration, log *slog.Logger
 		statsCache:   make(map[string]*container.StatsResponse),
 		streamCancel: make(map[string]context.CancelFunc),
 		intervalCh:   make(chan time.Duration, 1),
+		triggerCh:    make(chan chan struct{}, 1),
+		warnedNoNet:  make(map[string]bool),
+		warnedNoDisk: make(map[string]bool),
+	}
+}
+
+// ForcePoll triggers an immediate poll and waits for it to complete (or ctx to expire).
+func (w *Watcher) ForcePoll(ctx context.Context) error {
+	done := make(chan struct{})
+	select {
+	case w.triggerCh <- done:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -107,6 +131,36 @@ func (w *Watcher) Run(ctx context.Context) {
 	var pollRunning bool
 	var pollMu sync.Mutex
 
+	runPoll := func(done chan struct{}) {
+		pollMu.Lock()
+		if pollRunning {
+			pollMu.Unlock()
+			if done != nil {
+				close(done)
+			}
+			return
+		}
+		pollRunning = true
+		pollMu.Unlock()
+
+		go func() {
+			defer func() {
+				pollMu.Lock()
+				pollRunning = false
+				pollMu.Unlock()
+				if done != nil {
+					close(done)
+				}
+			}()
+			w.mu.Lock()
+			cur := w.interval
+			w.mu.Unlock()
+			pollCtx, cancel := context.WithTimeout(ctx, cur*9/10)
+			defer cancel()
+			w.poll(pollCtx)
+		}()
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -116,31 +170,14 @@ func (w *Watcher) Run(ctx context.Context) {
 			w.mu.Lock()
 			w.interval = d
 			w.mu.Unlock()
+		case done := <-w.triggerCh:
+			runPoll(done)
 		case <-ticker.C:
-			pollMu.Lock()
 			if pollRunning {
 				w.log.Warn("poll still running from previous tick — skipping")
-				pollMu.Unlock()
 				continue
 			}
-			pollRunning = true
-			pollMu.Unlock()
-
-			go func() {
-				defer func() {
-					pollMu.Lock()
-					pollRunning = false
-					pollMu.Unlock()
-				}()
-				// Poll is now just DB writes from cache — very fast.
-				// Give it a generous timeout in case ContainerList stalls.
-				w.mu.Lock()
-				cur := w.interval
-				w.mu.Unlock()
-				pollCtx, cancel := context.WithTimeout(ctx, cur*9/10)
-				defer cancel()
-				w.poll(pollCtx)
-			}()
+			runPoll(nil)
 		}
 	}
 }
@@ -294,6 +331,20 @@ func (w *Watcher) processContainer(c container.Summary) {
 
 	rx, tx := networkTotals(cur)
 	blkR, blkW, blkOK := blkioTotals(cur)
+
+	// Warn once per container when Docker provides no network or disk data.
+	// Likely causes: --network=host/none, Docker Desktop for Mac (no blkio),
+	// or cgroup v2 without blkio controller enabled.
+	if !w.warnedNoNet[c.ID] && len(cur.Networks) == 0 {
+		w.warnedNoNet[c.ID] = true
+		w.log.Warn("no network stats from Docker — container may use host/none networking; net metrics will be 0",
+			"id", shortID(c.ID), "name", summaryName(c))
+	}
+	if !w.warnedNoDisk[c.ID] && !blkOK {
+		w.warnedNoDisk[c.ID] = true
+		w.log.Warn("no blkio stats from Docker — platform may not expose block I/O (e.g. Docker Desktop); disk metrics will be 0",
+			"id", shortID(c.ID), "name", summaryName(c))
+	}
 
 	m := RawMetric{
 		ContainerID:    c.ID,

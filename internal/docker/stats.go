@@ -1,12 +1,9 @@
 package docker
 
 import (
-	"context"
-	"encoding/json"
 	"math"
 
 	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/client"
 )
 
 // cpuPercent computes per-core CPU% between two consecutive stats readings.
@@ -77,21 +74,6 @@ func blkioTotals(s *container.StatsResponse) (read, write int64, ok bool) {
 		}
 	}
 	return
-}
-
-// fetchStats fetches a single non-streaming stats snapshot for containerID.
-func fetchStats(ctx context.Context, cli *client.Client, containerID string) (*container.StatsResponse, error) {
-	rc, err := cli.ContainerStats(ctx, containerID, false)
-	if err != nil {
-		return nil, err
-	}
-	defer rc.Body.Close()
-
-	var s container.StatsResponse
-	if err := json.NewDecoder(rc.Body).Decode(&s); err != nil {
-		return nil, err
-	}
-	return &s, nil
 }
 
 // onlineCPUsFromStats resolves the online CPU count from a stats response,

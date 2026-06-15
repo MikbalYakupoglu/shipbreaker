@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -12,8 +13,6 @@ import (
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
 )
-
-const workerPoolSize = 10
 
 // ContainerInfo holds resolved identity + current status for a container.
 type ContainerInfo struct {
@@ -28,7 +27,7 @@ type ContainerInfo struct {
 	CreatedAt  int64  // Unix epoch seconds (Docker Created field)
 }
 
-// RawMetric is one per-minute sample.
+// RawMetric is one per-interval sample.
 type RawMetric struct {
 	ContainerID    string
 	Timestamp      int64
@@ -46,41 +45,40 @@ type Sink interface {
 	UpsertContainer(info ContainerInfo) error
 	InsertRawMetric(m RawMetric) error
 	MarkRemoved(containerID string, at int64) error
-	// MarkExitedIfNotIn sets status='exited' for any running container whose ID
-	// is not in runningIDs. Called after each poll to catch containers that
-	// stopped while the watcher was down.
 	MarkExitedIfNotIn(runningIDs []string, at int64) error
 }
 
-// Watcher polls Docker stats every interval and streams events.
+// Watcher maintains a persistent stats stream per container and writes
+// sampled metrics to the Sink on each interval tick.
 type Watcher struct {
-	cli      *client.Client
-	sink     Sink
-	log      *slog.Logger
+	cli  *client.Client
+	sink Sink
+	log  *slog.Logger
 
-	mu         sync.Mutex
-	interval   time.Duration
-	prevRead   map[string]*container.StatsResponse // containerID → last stats snapshot
-	hostCPUs   uint32
-	intervalCh chan time.Duration
+	mu           sync.Mutex
+	interval     time.Duration
+	hostCPUs     uint32
+	prevRead     map[string]*container.StatsResponse // last frame used for CPU delta
+	statsCache   map[string]*container.StatsResponse // latest frame from stream
+	streamCancel map[string]context.CancelFunc        // per-container stream lifecycle
+	intervalCh   chan time.Duration
 }
 
-// New creates a Watcher. cli must have been opened with WithAPIVersionNegotiation.
 func New(cli *client.Client, sink Sink, interval time.Duration, log *slog.Logger) *Watcher {
 	return &Watcher{
-		cli:        cli,
-		sink:       sink,
-		interval:   interval,
-		log:        log,
-		prevRead:   make(map[string]*container.StatsResponse),
-		intervalCh: make(chan time.Duration, 1),
+		cli:          cli,
+		sink:         sink,
+		interval:     interval,
+		log:          log,
+		prevRead:     make(map[string]*container.StatsResponse),
+		statsCache:   make(map[string]*container.StatsResponse),
+		streamCancel: make(map[string]context.CancelFunc),
+		intervalCh:   make(chan time.Duration, 1),
 	}
 }
 
-// SetInterval changes the polling interval at runtime.
-// Safe to call from any goroutine.
+// SetInterval changes the polling interval at runtime. Safe to call from any goroutine.
 func (w *Watcher) SetInterval(d time.Duration) {
-	// Drain any pending update that hasn't been consumed yet.
 	select {
 	case <-w.intervalCh:
 	default:
@@ -88,9 +86,16 @@ func (w *Watcher) SetInterval(d time.Duration) {
 	w.intervalCh <- d
 }
 
-// Run starts the polling loop and events listener. Blocks until ctx is cancelled.
+// Run starts the polling loop and the events listener. Blocks until ctx is cancelled.
 func (w *Watcher) Run(ctx context.Context) {
 	w.cacheHostCPUs(ctx)
+
+	// Open a stats stream for every container already running at startup.
+	if cs, err := w.cli.ContainerList(ctx, container.ListOptions{}); err == nil {
+		for _, c := range cs {
+			w.startStatsStream(ctx, c.ID)
+		}
+	}
 
 	go w.runEvents(ctx)
 
@@ -99,8 +104,8 @@ func (w *Watcher) Run(ctx context.Context) {
 	w.mu.Unlock()
 	defer ticker.Stop()
 
-	var loopRunning bool
-	var loopMu sync.Mutex
+	var pollRunning bool
+	var pollMu sync.Mutex
 
 	for {
 		select {
@@ -112,32 +117,108 @@ func (w *Watcher) Run(ctx context.Context) {
 			w.interval = d
 			w.mu.Unlock()
 		case <-ticker.C:
-			loopMu.Lock()
-			if loopRunning {
-				w.log.Warn("stats poll still running from previous tick — skipping")
-				loopMu.Unlock()
+			pollMu.Lock()
+			if pollRunning {
+				w.log.Warn("poll still running from previous tick — skipping")
+				pollMu.Unlock()
 				continue
 			}
-			loopRunning = true
-			loopMu.Unlock()
-
-			w.mu.Lock()
-			curInterval := w.interval
-			w.mu.Unlock()
+			pollRunning = true
+			pollMu.Unlock()
 
 			go func() {
 				defer func() {
-					loopMu.Lock()
-					loopRunning = false
-					loopMu.Unlock()
+					pollMu.Lock()
+					pollRunning = false
+					pollMu.Unlock()
 				}()
-				// Cancel the poll before the next tick so stalled Docker API
-				// calls don't pile up across intervals.
-				pollCtx, cancel := context.WithTimeout(ctx, curInterval*9/10)
+				// Poll is now just DB writes from cache — very fast.
+				// Give it a generous timeout in case ContainerList stalls.
+				w.mu.Lock()
+				cur := w.interval
+				w.mu.Unlock()
+				pollCtx, cancel := context.WithTimeout(ctx, cur*9/10)
 				defer cancel()
 				w.poll(pollCtx)
 			}()
 		}
+	}
+}
+
+// startStatsStream opens a persistent streaming stats connection for containerID.
+// Duplicate calls for the same ID are ignored.
+func (w *Watcher) startStatsStream(ctx context.Context, containerID string) {
+	w.mu.Lock()
+	if _, exists := w.streamCancel[containerID]; exists {
+		w.mu.Unlock()
+		return
+	}
+	streamCtx, cancel := context.WithCancel(ctx)
+	w.streamCancel[containerID] = cancel
+	w.mu.Unlock()
+
+	go w.runStatsStream(streamCtx, containerID)
+}
+
+// stopStatsStream cancels the streaming goroutine and clears cached state for containerID.
+func (w *Watcher) stopStatsStream(containerID string) {
+	w.mu.Lock()
+	cancel, ok := w.streamCancel[containerID]
+	if ok {
+		delete(w.streamCancel, containerID)
+		delete(w.statsCache, containerID)
+		delete(w.prevRead, containerID)
+	}
+	w.mu.Unlock()
+	if ok {
+		cancel() // called outside the lock — goroutine defer also holds w.mu
+	}
+}
+
+func (w *Watcher) runStatsStream(ctx context.Context, containerID string) {
+	defer func() {
+		w.mu.Lock()
+		delete(w.statsCache, containerID)
+		w.mu.Unlock()
+	}()
+
+	backoff := time.Second
+	for ctx.Err() == nil {
+		rc, err := w.cli.ContainerStats(ctx, containerID, true)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			w.log.Warn("stats stream open failed", "id", shortID(containerID), "err", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
+			continue
+		}
+		backoff = time.Second // reset on success
+
+		dec := json.NewDecoder(rc.Body)
+		for ctx.Err() == nil {
+			var s container.StatsResponse
+			if err := dec.Decode(&s); err != nil {
+				rc.Body.Close()
+				if ctx.Err() != nil {
+					return
+				}
+				// Transient decode error — reconnect silently.
+				w.log.Debug("stats stream reconnecting", "id", shortID(containerID), "err", err)
+				break
+			}
+			w.mu.Lock()
+			w.statsCache[containerID] = &s
+			w.mu.Unlock()
+		}
+		rc.Body.Close()
 	}
 }
 
@@ -151,7 +232,8 @@ func (w *Watcher) cacheHostCPUs(ctx context.Context) {
 	w.hostCPUs = uint32(info.NCPU)
 }
 
-// poll collects stats for all running containers using a bounded worker pool.
+// poll reads the latest stats from each container's in-memory cache and
+// writes a metric row to the DB. No HTTP requests are made here.
 func (w *Watcher) poll(ctx context.Context) {
 	containers, err := w.cli.ContainerList(ctx, container.ListOptions{})
 	if err != nil {
@@ -159,43 +241,19 @@ func (w *Watcher) poll(ctx context.Context) {
 		return
 	}
 
-	type job struct {
-		c container.Summary
-	}
-	jobs := make(chan job, len(containers))
 	runningIDs := make([]string, 0, len(containers))
 	for _, c := range containers {
-		jobs <- job{c}
 		runningIDs = append(runningIDs, c.ID)
+		w.processContainer(c)
 	}
-	close(jobs)
 
-	var wg sync.WaitGroup
-	for i := 0; i < workerPoolSize; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := range jobs {
-				if ctx.Err() != nil {
-					return
-				}
-				w.processContainer(ctx, j.c)
-			}
-		}()
-	}
-	wg.Wait()
-
-	// Reconcile: mark as exited any DB container that Docker no longer reports
-	// as running. This catches containers that stopped while the watcher was down.
 	if err := w.sink.MarkExitedIfNotIn(runningIDs, time.Now().UTC().Unix()); err != nil {
 		w.log.Warn("reconcile exited containers", "err", err)
 	}
 }
 
-func (w *Watcher) processContainer(ctx context.Context, c container.Summary) {
+func (w *Watcher) processContainer(c container.Summary) {
 	key := resolveServiceKey(c)
-	id := serviceID(key)
-
 	info := ContainerInfo{
 		ID:         c.ID,
 		Name:       summaryName(c),
@@ -203,7 +261,7 @@ func (w *Watcher) processContainer(ctx context.Context, c container.Summary) {
 		ImageRepo:  imageRepo(c.Image),
 		ImageID:    c.ImageID,
 		ServiceKey: key,
-		ServiceID:  id,
+		ServiceID:  serviceID(key),
 		Status:     normalizeStatus(c.State),
 		CreatedAt:  c.Created,
 	}
@@ -216,39 +274,32 @@ func (w *Watcher) processContainer(ctx context.Context, c container.Summary) {
 		return
 	}
 
-	// Per-container timeout: a single unresponsive container must not
-	// hold a worker for the entire poll window.
-	statsCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	stats, err := fetchStats(statsCtx, w.cli, c.ID)
-	if err != nil {
-		if ctx.Err() == nil {
-			// Only log if the poll itself wasn't cancelled — avoids
-			// duplicate noise when the poll-level timeout fires.
-			w.log.Warn("fetch stats failed", "id", shortID(c.ID), "err", err)
-		}
-		return
-	}
-
 	w.mu.Lock()
+	cur := w.statsCache[c.ID]
 	prev := w.prevRead[c.ID]
-	w.prevRead[c.ID] = stats
+	if cur != nil {
+		w.prevRead[c.ID] = cur
+	}
 	w.mu.Unlock()
 
-	onlineCPUs := onlineCPUsFromStats(stats, w.hostCPUs)
-	cpu, skip := cpuPercent(stats, prev, onlineCPUs)
+	if cur == nil {
+		return // stream not yet populated
+	}
+
+	onlineCPUs := onlineCPUsFromStats(cur, w.hostCPUs)
+	cpu, skip := cpuPercent(cur, prev, onlineCPUs)
 	if skip {
 		return
 	}
 
-	rx, tx := networkTotals(stats)
-	blkR, blkW, blkOK := blkioTotals(stats)
+	rx, tx := networkTotals(cur)
+	blkR, blkW, blkOK := blkioTotals(cur)
 
 	m := RawMetric{
 		ContainerID:    c.ID,
 		Timestamp:      time.Now().UTC().Unix(),
 		CPUPercent:     cpu,
-		MemoryWSBytes:  memoryWorkingSet(stats),
+		MemoryWSBytes:  memoryWorkingSet(cur),
 		NetRxBytes:     rx,
 		NetTxBytes:     tx,
 		BlkReadBytes:   blkR,
@@ -290,7 +341,7 @@ func (w *Watcher) runEvents(ctx context.Context) {
 				loop = false
 			case msg := <-msgCh:
 				since = fmt.Sprintf("%d", msg.TimeNano)
-				backoff = time.Second // reset on success
+				backoff = time.Second
 				w.handleEvent(ctx, msg)
 			}
 		}
@@ -304,7 +355,6 @@ func (w *Watcher) runEvents(ctx context.Context) {
 			}
 		}
 
-		// Resync after reconnect
 		w.resync(ctx)
 	}
 }
@@ -316,15 +366,15 @@ func (w *Watcher) handleEvent(ctx context.Context, msg events.Message) {
 	switch msg.Action {
 	case "start":
 		w.updateStatusFromEvent(ctx, id, "running", now)
+		w.startStatsStream(ctx, id)
 	case "stop", "die", "pause":
 		w.updateStatusFromEvent(ctx, id, "exited", now)
+		w.stopStatsStream(id)
 	case "destroy":
 		if err := w.sink.MarkRemoved(id, now); err != nil {
 			w.log.Error("mark removed", "id", shortID(id), "err", err)
 		}
-		w.mu.Lock()
-		delete(w.prevRead, id)
-		w.mu.Unlock()
+		w.stopStatsStream(id)
 	}
 }
 
@@ -341,12 +391,33 @@ func (w *Watcher) updateStatusFromEvent(ctx context.Context, id, status string, 
 }
 
 func (w *Watcher) resync(ctx context.Context) {
-	containers, err := w.cli.ContainerList(ctx, container.ListOptions{})
+	cs, err := w.cli.ContainerList(ctx, container.ListOptions{})
 	if err != nil {
 		w.log.Warn("resync: container list failed", "err", err)
 		return
 	}
-	for _, c := range containers {
+
+	runningSet := make(map[string]bool, len(cs))
+	for _, c := range cs {
+		runningSet[c.ID] = true
+	}
+
+	// Stop streams for containers no longer in Docker's running list.
+	w.mu.Lock()
+	var toCancel []context.CancelFunc
+	for id, cancel := range w.streamCancel {
+		if !runningSet[id] {
+			toCancel = append(toCancel, cancel)
+			delete(w.streamCancel, id)
+			delete(w.statsCache, id)
+		}
+	}
+	w.mu.Unlock()
+	for _, cancel := range toCancel {
+		cancel()
+	}
+
+	for _, c := range cs {
 		key := resolveServiceKey(c)
 		info := ContainerInfo{
 			ID:         c.ID,
@@ -362,6 +433,7 @@ func (w *Watcher) resync(ctx context.Context) {
 		if err := w.sink.UpsertContainer(info); err != nil {
 			w.log.Warn("resync: upsert failed", "id", shortID(c.ID), "err", err)
 		}
+		w.startStatsStream(ctx, c.ID)
 	}
 }
 

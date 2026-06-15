@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -31,10 +32,11 @@ type Server struct {
 	cfg             *config.Config
 	watcher         IntervalSetter
 	defaultInterval time.Duration
+	log             *slog.Logger
 }
 
 // New builds and wires up the chi router.
-func New(reader *sql.DB, an *analyzer.Analyzer, cfg *config.Config, auth *authState, watcher IntervalSetter) *Server {
+func New(reader *sql.DB, an *analyzer.Analyzer, cfg *config.Config, auth *authState, watcher IntervalSetter, log *slog.Logger) *Server {
 	s := &Server{
 		router:          chi.NewRouter(),
 		db:              reader,
@@ -44,6 +46,7 @@ func New(reader *sql.DB, an *analyzer.Analyzer, cfg *config.Config, auth *authSt
 		cfg:             cfg,
 		watcher:         watcher,
 		defaultInterval: time.Duration(cfg.SampleIntervalSec) * time.Second,
+		log:             log,
 	}
 	if cfg.TrustedProxies != "" {
 		for _, cidr := range splitTrim(cfg.TrustedProxies) {
@@ -182,6 +185,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleZombies(w http.ResponseWriter, r *http.Request) {
 	results, err := s.an.Run(r.Context())
 	if err != nil {
+		s.log.Error("handleZombies: analyzer run failed", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -297,6 +301,7 @@ func (s *Server) handleServiceMetrics(w http.ResponseWriter, r *http.Request) {
 		ORDER BY h.bucket ASC
 	`, svcID)
 	if err != nil {
+		s.log.Error("handleServiceMetrics: query failed", "service_id", svcID, "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -348,6 +353,7 @@ func (s *Server) handleContainers(w http.ResponseWriter, r *http.Request) {
 		ORDER BY last_seen_at DESC
 	`)
 	if err != nil {
+		s.log.Error("handleContainers: query failed", "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -394,6 +400,7 @@ func (s *Server) handleContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
+		s.log.Error("handleContainer: query failed", "container_id", id, "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -439,6 +446,7 @@ func (s *Server) handleContainerRawMetrics(w http.ResponseWriter, r *http.Reques
 		ORDER BY timestamp DESC LIMIT 60
 	`, id)
 	if err != nil {
+		s.log.Error("handleContainerRawMetrics: query failed", "container_id", id, "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}

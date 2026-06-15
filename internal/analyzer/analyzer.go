@@ -3,6 +3,7 @@ package analyzer
 import (
 	"context"
 	"database/sql"
+	"math"
 	"time"
 )
 
@@ -44,10 +45,40 @@ func New(reader *sql.DB, cfg Config) *Analyzer {
 	return &Analyzer{r: reader, cfg: cfg}
 }
 
-// Run evaluates ALL non-removed services, returning results even for those with insufficient data.
+type containerGen struct {
+	id        string
+	imageID   string
+	createdAt int64
+}
+
+type hourlyRow struct {
+	bucket      int64
+	cpuAvg      float64
+	sampleCount int64
+	netRx       int64
+	netTx       int64
+	blkR        int64
+	blkW        int64
+}
+
+type rawRow struct {
+	timestamp int64
+	cpuPct    float64
+	netRx     int64
+	netTx     int64
+	blkR      int64
+	blkW      int64
+}
+
+// Run evaluates ALL non-removed services using 4 batch queries instead of 4N.
 func (a *Analyzer) Run(ctx context.Context) ([]ServiceResult, error) {
-	// Include all known (non-removed) services — metrics existence not required.
-	rows, err := a.r.QueryContext(ctx, `
+	now := time.Now().UTC().Unix()
+	W := int64(a.cfg.WindowDays) * 86400
+	windowStart := now - W
+	currentBucket := now - (now % 3600)
+
+	// ── 1. All non-removed services ──────────────────────────────────────────
+	svcRows, err := a.r.QueryContext(ctx, `
 		SELECT DISTINCT c.service_id, c.service_key, c.name, c.image
 		FROM containers c
 		WHERE c.status != 'removed'
@@ -55,14 +86,13 @@ func (a *Analyzer) Run(ctx context.Context) ([]ServiceResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
 	type svcKey struct{ id, key, name, image string }
 	var services []svcKey
 	seen := map[string]bool{}
-	for rows.Next() {
+	for svcRows.Next() {
 		var s svcKey
-		if err := rows.Scan(&s.id, &s.key, &s.name, &s.image); err != nil {
+		if err := svcRows.Scan(&s.id, &s.key, &s.name, &s.image); err != nil {
+			svcRows.Close()
 			return nil, err
 		}
 		if !seen[s.id] {
@@ -70,68 +100,132 @@ func (a *Analyzer) Run(ctx context.Context) ([]ServiceResult, error) {
 			services = append(services, s)
 		}
 	}
-	if err := rows.Err(); err != nil {
+	svcRows.Close()
+	if err := svcRows.Err(); err != nil {
 		return nil, err
 	}
 
-	var results []ServiceResult
-	for _, svc := range services {
-		res, err := a.evaluateService(ctx, svc.id, svc.key, svc.name, svc.image, time.Now().UTC().Unix())
-		if err != nil {
-			continue
+	// ── 2. All containers (newest first per service, for image-change clamping) ─
+	containerMap := map[string][]containerGen{}
+	cRows, err := a.r.QueryContext(ctx, `
+		SELECT service_id, id, COALESCE(image_id, ''), created_at
+		FROM containers
+		WHERE status != 'removed'
+		ORDER BY service_id, created_at DESC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	for cRows.Next() {
+		var svcID string
+		var g containerGen
+		if err := cRows.Scan(&svcID, &g.id, &g.imageID, &g.createdAt); err != nil {
+			cRows.Close()
+			return nil, err
 		}
-		results = append(results, res)
+		containerMap[svcID] = append(containerMap[svcID], g)
+	}
+	cRows.Close()
+	if err := cRows.Err(); err != nil {
+		return nil, err
+	}
+
+	// ── 3. All hourly data within the full observation window ─────────────────
+	hourlyMap := map[string][]hourlyRow{}
+	hRows, err := a.r.QueryContext(ctx, `
+		SELECT c.service_id,
+		       h.bucket, h.cpu_percent_avg, h.sample_count,
+		       h.net_rx_delta, h.net_tx_delta, h.blk_read_delta, h.blk_write_delta
+		FROM metrics_hourly h
+		JOIN containers c ON c.id = h.container_id
+		WHERE h.bucket >= ? AND h.bucket < ?
+	`, windowStart, currentBucket)
+	if err != nil {
+		return nil, err
+	}
+	for hRows.Next() {
+		var svcID string
+		var r hourlyRow
+		if err := hRows.Scan(&svcID, &r.bucket, &r.cpuAvg, &r.sampleCount,
+			&r.netRx, &r.netTx, &r.blkR, &r.blkW); err != nil {
+			hRows.Close()
+			return nil, err
+		}
+		hourlyMap[svcID] = append(hourlyMap[svcID], r)
+	}
+	hRows.Close()
+	if err := hRows.Err(); err != nil {
+		return nil, err
+	}
+
+	// ── 4. Raw data for the current (incomplete) hourly bucket ───────────────
+	rawMap := map[string][]rawRow{}
+	rRows, err := a.r.QueryContext(ctx, `
+		SELECT c.service_id,
+		       r.timestamp, r.cpu_percent,
+		       r.net_rx_bytes, r.net_tx_bytes, r.blk_read_bytes, r.blk_write_bytes
+		FROM metrics_raw r
+		JOIN containers c ON c.id = r.container_id
+		WHERE r.timestamp >= ?
+	`, currentBucket)
+	if err != nil {
+		return nil, err
+	}
+	for rRows.Next() {
+		var svcID string
+		var r rawRow
+		if err := rRows.Scan(&svcID, &r.timestamp, &r.cpuPct,
+			&r.netRx, &r.netTx, &r.blkR, &r.blkW); err != nil {
+			rRows.Close()
+			return nil, err
+		}
+		rawMap[svcID] = append(rawMap[svcID], r)
+	}
+	rRows.Close()
+	if err := rRows.Err(); err != nil {
+		return nil, err
+	}
+
+	// ── 5. Evaluate each service in memory (no more DB calls) ─────────────────
+	results := make([]ServiceResult, 0, len(services))
+	for _, svc := range services {
+		results = append(results, a.evaluateInMemory(
+			svc.id, svc.key, svc.name, svc.image,
+			now, W, currentBucket,
+			containerMap[svc.id],
+			hourlyMap[svc.id],
+			rawMap[svc.id],
+		))
 	}
 	return results, nil
 }
 
-func (a *Analyzer) evaluateService(
-	ctx context.Context,
+func (a *Analyzer) evaluateInMemory(
 	serviceID, serviceKey, name, image string,
-	now int64,
-) (ServiceResult, error) {
-	W := int64(a.cfg.WindowDays) * 86400
-
-	// Fetch ALL containers for this service ordered newest first.
-	// No created_at cutoff — we need the full history to detect last image change.
-	containerRows, err := a.r.QueryContext(ctx, `
-		SELECT id, image_id, created_at FROM containers
-		WHERE service_id = ?
-		ORDER BY created_at DESC
-	`, serviceID)
-	if err != nil {
-		return ServiceResult{}, err
-	}
-	type gen struct {
-		id        string
-		imageID   string
-		createdAt int64
-	}
-	var gens []gen
-	for containerRows.Next() {
-		var g gen
-		var imgID sql.NullString
-		if err := containerRows.Scan(&g.id, &imgID, &g.createdAt); err != nil {
-			containerRows.Close()
-			return ServiceResult{}, err
+	now, W, currentBucket int64,
+	gens []containerGen,
+	hourly []hourlyRow,
+	raw []rawRow,
+) ServiceResult {
+	insufficient := func(count int) ServiceResult {
+		return ServiceResult{
+			ServiceID:   serviceID,
+			ServiceKey:  serviceKey,
+			Name:        name,
+			Image:       image,
+			Status:      StatusInsufficient,
+			SampleCount: count,
 		}
-		g.imageID = imgID.String
-		gens = append(gens, g)
 	}
-	containerRows.Close()
 
 	if len(gens) == 0 {
-		return ServiceResult{ServiceID: serviceID, ServiceKey: serviceKey,
-			Name: name, Image: image, Status: StatusInsufficient}, nil
+		return insufficient(0)
 	}
 
-	// Determine clamped window start (Y1).
-	// Find the start of the current image's continuous unbroken run.
+	// Determine clamped window start based on current image's continuous run.
+	clampedStart := now - W
 	currentImageID := gens[0].imageID
-	clampedStart := now - W // default: full window
-
 	if currentImageID != "" {
-		// Walk newest→oldest; find where the current imageID starts continuously.
 		lastImageChange := int64(0)
 		for _, g := range gens {
 			if g.imageID != currentImageID {
@@ -139,52 +233,104 @@ func (a *Analyzer) evaluateService(
 			}
 			lastImageChange = g.createdAt
 		}
-		// Only clamp if the image change happened within the window.
 		if lastImageChange > now-W {
 			clampedStart = lastImageChange
 		}
 	}
 
-	// Count distinct hourly buckets in the clamped window for this service.
-	var sampleCount int
-	err = a.r.QueryRowContext(ctx, `
-		SELECT COUNT(DISTINCT h.bucket)
-		FROM metrics_hourly h
-		JOIN containers c ON c.id = h.container_id
-		WHERE c.service_id = ? AND h.bucket >= ? AND h.bucket < ?
-	`, serviceID, clampedStart, now).Scan(&sampleCount)
-	if err != nil {
-		return ServiceResult{}, err
+	// Count distinct hourly buckets within clamped window.
+	seenBuckets := map[int64]struct{}{}
+	for _, h := range hourly {
+		if h.bucket >= clampedStart {
+			seenBuckets[h.bucket] = struct{}{}
+		}
 	}
+	sampleCount := len(seenBuckets)
 
-	// Count buckets from the current (incomplete) hour in metrics_raw.
-	currentBucket := now - (now % 3600)
-	var rawBuckets int
-	_ = a.r.QueryRowContext(ctx, `
-		SELECT COUNT(DISTINCT (r.timestamp - (r.timestamp % 3600)))
-		FROM metrics_raw r
-		JOIN containers c ON c.id = r.container_id
-		WHERE c.service_id = ? AND r.timestamp >= ? AND r.timestamp >= ?
-	`, serviceID, clampedStart, currentBucket).Scan(&rawBuckets)
-	if rawBuckets > 0 {
-		sampleCount += rawBuckets
+	// Count distinct raw buckets in current hour (within clamped window).
+	seenRawBuckets := map[int64]struct{}{}
+	for _, r := range raw {
+		if r.timestamp >= clampedStart {
+			b := r.timestamp - (r.timestamp % 3600)
+			seenRawBuckets[b] = struct{}{}
+		}
 	}
+	sampleCount += len(seenRawBuckets)
 
-	// minSamples is measured against full W (plan 5.1).
 	if sampleCount < a.cfg.MinSamples {
-		return ServiceResult{
-			ServiceID:   serviceID,
-			ServiceKey:  serviceKey,
-			Name:        name,
-			Image:       image,
-			Status:      StatusInsufficient,
-			SampleCount: sampleCount,
-		}, nil
+		return insufficient(sampleCount)
 	}
 
-	cpuAvg, netBytes, diskBytes, err := a.computeMetrics(ctx, serviceID, clampedStart, now)
-	if err != nil {
-		return ServiceResult{}, err
+	// Aggregate hourly metrics.
+	var cpuWeighted, totalSamples float64
+	var netBytes, diskBytes float64
+	hasDisk := false
+	for _, h := range hourly {
+		if h.bucket < clampedStart {
+			continue
+		}
+		sc := float64(h.sampleCount)
+		cpuWeighted += h.cpuAvg * sc
+		totalSamples += sc
+		netBytes += float64(h.netRx + h.netTx)
+		diskBytes += float64(h.blkR + h.blkW)
+		hasDisk = true
+	}
+
+	// Merge current-bucket raw metrics (delta = max - min per counter).
+	var rawCPUSum float64
+	var rawCount int64
+	minNetRx, maxNetRx := int64(math.MaxInt64), int64(math.MinInt64)
+	minNetTx, maxNetTx := int64(math.MaxInt64), int64(math.MinInt64)
+	minBlkR, maxBlkR := int64(math.MaxInt64), int64(math.MinInt64)
+	minBlkW, maxBlkW := int64(math.MaxInt64), int64(math.MinInt64)
+	for _, r := range raw {
+		if r.timestamp < clampedStart {
+			continue
+		}
+		rawCPUSum += r.cpuPct
+		rawCount++
+		if r.netRx < minNetRx {
+			minNetRx = r.netRx
+		}
+		if r.netRx > maxNetRx {
+			maxNetRx = r.netRx
+		}
+		if r.netTx < minNetTx {
+			minNetTx = r.netTx
+		}
+		if r.netTx > maxNetTx {
+			maxNetTx = r.netTx
+		}
+		if r.blkR < minBlkR {
+			minBlkR = r.blkR
+		}
+		if r.blkR > maxBlkR {
+			maxBlkR = r.blkR
+		}
+		if r.blkW < minBlkW {
+			minBlkW = r.blkW
+		}
+		if r.blkW > maxBlkW {
+			maxBlkW = r.blkW
+		}
+	}
+	if rawCount > 0 {
+		rawCPUAvg := rawCPUSum / float64(rawCount)
+		cpuWeighted += rawCPUAvg * float64(rawCount)
+		totalSamples += float64(rawCount)
+		if minNetRx != math.MaxInt64 {
+			netBytes += float64((maxNetRx - minNetRx) + (maxNetTx - minNetTx))
+		}
+		if minBlkR != math.MaxInt64 {
+			diskBytes += float64((maxBlkR - minBlkR) + (maxBlkW - minBlkW))
+			hasDisk = true
+		}
+	}
+
+	var cpuAvg float64
+	if totalSamples > 0 {
+		cpuAvg = cpuWeighted / totalSamples
 	}
 
 	windowDays := float64(now-clampedStart) / 86400.0
@@ -197,7 +343,7 @@ func (a *Analyzer) evaluateService(
 
 	isZombie := cpuAvg < a.cfg.CPUThresholdPct &&
 		netPerDay < a.cfg.NetThresholdPerDay &&
-		(diskBytes < 0 || diskPerDay < a.cfg.DiskThresholdPerDay)
+		(!hasDisk || diskPerDay < a.cfg.DiskThresholdPerDay)
 
 	status := StatusActive
 	if isZombie {
@@ -215,71 +361,5 @@ func (a *Analyzer) evaluateService(
 		DiskBytesDay: diskPerDay,
 		WindowDays:   windowDays,
 		SampleCount:  sampleCount,
-	}, nil
-}
-
-func (a *Analyzer) computeMetrics(
-	ctx context.Context,
-	serviceID string,
-	clampedStart, now int64,
-) (cpuAvg float64, netBytes, diskBytes float64, err error) {
-	currentBucket := now - (now % 3600)
-
-	row := a.r.QueryRowContext(ctx, `
-		SELECT
-			SUM(h.cpu_percent_avg * h.sample_count),
-			SUM(h.sample_count),
-			SUM(h.net_rx_delta + h.net_tx_delta),
-			SUM(h.blk_read_delta + h.blk_write_delta)
-		FROM metrics_hourly h
-		JOIN containers c ON c.id = h.container_id
-		WHERE c.service_id = ? AND h.bucket >= ? AND h.bucket < ?
-	`, serviceID, clampedStart, currentBucket)
-
-	var cpuWeighted, totalSamples, netSum, diskSum sql.NullFloat64
-	if err = row.Scan(&cpuWeighted, &totalSamples, &netSum, &diskSum); err != nil {
-		return
 	}
-
-	rawRow := a.r.QueryRowContext(ctx, `
-		SELECT
-			AVG(r.cpu_percent),
-			COUNT(*),
-			MAX(r.net_rx_bytes) - MIN(r.net_rx_bytes) + MAX(r.net_tx_bytes) - MIN(r.net_tx_bytes),
-			MAX(r.blk_read_bytes) - MIN(r.blk_read_bytes) + MAX(r.blk_write_bytes) - MIN(r.blk_write_bytes)
-		FROM metrics_raw r
-		JOIN containers c ON c.id = r.container_id
-		WHERE c.service_id = ? AND r.timestamp >= ? AND r.timestamp >= ?
-	`, serviceID, clampedStart, currentBucket)
-
-	var rawCPU, rawNet, rawDisk sql.NullFloat64
-	var rawCount sql.NullInt64
-	_ = rawRow.Scan(&rawCPU, &rawCount, &rawNet, &rawDisk)
-
-	totalW := totalSamples.Float64
-	cpuW := cpuWeighted.Float64
-	if rawCPU.Valid && rawCount.Valid && rawCount.Int64 > 0 {
-		cpuW += rawCPU.Float64 * float64(rawCount.Int64)
-		totalW += float64(rawCount.Int64)
-	}
-	if totalW > 0 {
-		cpuAvg = cpuW / totalW
-	}
-
-	netBytes = netSum.Float64
-	if rawNet.Valid {
-		netBytes += rawNet.Float64
-	}
-
-	if !diskSum.Valid {
-		diskBytes = -1
-	} else {
-		diskBytes = diskSum.Float64
-		if rawDisk.Valid {
-			diskBytes += rawDisk.Float64
-		}
-	}
-
-	err = nil
-	return
 }

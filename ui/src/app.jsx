@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'preact/hooks'
+import { useState, useEffect, useRef } from 'preact/hooks'
 import { fetchConfig, fetchZombies, fetchContainers, fetchSnapshot, setLiveMode as apiSetLiveMode } from './api.js'
 import { Login } from './components/Login.jsx'
 import { ServiceTable } from './components/ServiceTable.jsx'
@@ -14,6 +14,15 @@ export function App() {
   const [containers, setContainers] = useState(null)
   const [snapshots, setSnapshots] = useState({})
   const [loading, setLoading] = useState(true)
+
+  function switchTab(next) {
+    if (next === tab) return
+    if (next === 'containers' && containers === null) setLoading(true)
+    if (next === 'zombies' && zombies === null) setLoading(true)
+    setTab(next)
+  }
+  const zombieReqRef = useRef(false)
+  const containerReqRef = useRef(false)
   const [reloading, setReloading] = useState(false)
   const [liveMode, setLiveMode] = useState(false)
   const [lastUpdated, setLastUpdated] = useState(null)
@@ -46,64 +55,82 @@ export function App() {
     return () => clearInterval(id)
   }, [])
 
-  // Full data reload — interval depends on live mode
-  useEffect(() => {
-    if (!authed) return
-    loadData()
-    const liveMs = (cfg?.live_interval_sec ?? 5) * 1000
-    const normalMs = (cfg?.sample_interval_sec ?? 60) * 1000
-    const ms = liveMode ? liveMs : normalMs
-    const id = setInterval(loadData, ms)
-    return () => clearInterval(id)
-  }, [authed, liveMode, cfg])
+  const pollMs = liveMode
+    ? (cfg?.live_interval_sec ?? 5) * 1000
+    : (cfg?.sample_interval_sec ?? 60) * 1000
 
-  // Snapshot polling — interval depends on live mode
+  // Zombies + snapshot polling — only when on services tab
   useEffect(() => {
-    if (!authed) return
-    const loadSnap = async () => {
-      try {
-        const data = await fetchSnapshot()
-        setSnapshots(data)
-        setLastUpdated(new Date())
-      } catch {}
-    }
-    loadSnap()
-    const liveMs = (cfg?.live_interval_sec ?? 5) * 1000
-    const normalMs = (cfg?.sample_interval_sec ?? 60) * 1000
-    const ms = liveMode ? liveMs : normalMs
-    const id = setInterval(loadSnap, ms)
-    return () => clearInterval(id)
-  }, [authed, liveMode, cfg])
+    if (!authed || tab !== 'zombies') return
+    loadZombies()
+    loadSnapshot()
+    const zi = setInterval(loadZombies, pollMs)
+    const si = setInterval(loadSnapshot, pollMs)
+    return () => { clearInterval(zi); clearInterval(si) }
+  }, [authed, tab, pollMs])
 
-  async function loadData() {
+  // Container polling — only when on containers tab
+  useEffect(() => {
+    if (!authed || tab !== 'containers') return
+    loadContainers()
+    const id = setInterval(loadContainers, pollMs)
+    return () => clearInterval(id)
+  }, [authed, tab, pollMs])
+
+  async function loadZombies() {
+    if (zombieReqRef.current) return
+    zombieReqRef.current = true
     try {
-      const [z, c] = await Promise.all([fetchZombies(), fetchContainers()])
+      const z = await fetchZombies()
       setZombies(z)
+      setLoading(false)
+      setNeedLogin(false)
+    } catch (err) {
+      if (err.status === 401) { setNeedLogin(true); setAuthed(false) }
+      setLoading(false)
+    } finally {
+      zombieReqRef.current = false
+    }
+  }
+
+  async function loadContainers() {
+    if (containerReqRef.current) return
+    containerReqRef.current = true
+    try {
+      const c = await fetchContainers()
       setContainers(c)
       setLoading(false)
       setNeedLogin(false)
     } catch (err) {
-      if (err.status === 401) {
-        setNeedLogin(true)
-        setAuthed(false)
-      }
+      if (err.status === 401) { setNeedLogin(true); setAuthed(false) }
       setLoading(false)
+    } finally {
+      containerReqRef.current = false
     }
+  }
+
+  async function loadSnapshot() {
+    try {
+      const data = await fetchSnapshot()
+      setSnapshots(data)
+      setLastUpdated(new Date())
+    } catch {}
   }
 
   async function handleReload() {
     setReloading(true)
     try {
-      const [z, c, snap] = await Promise.all([fetchZombies(), fetchContainers(), fetchSnapshot()])
-      setZombies(z)
-      setContainers(c)
-      setSnapshots(snap)
-      setLastUpdated(new Date())
-    } catch (err) {
-      if (err.status === 401) {
-        setNeedLogin(true)
-        setAuthed(false)
+      if (tab === 'zombies') {
+        const [z, snap] = await Promise.all([fetchZombies(), fetchSnapshot()])
+        setZombies(z)
+        setSnapshots(snap)
+        setLastUpdated(new Date())
+      } else {
+        const c = await fetchContainers()
+        setContainers(c)
       }
+    } catch (err) {
+      if (err.status === 401) { setNeedLogin(true); setAuthed(false) }
     } finally {
       setReloading(false)
     }
@@ -179,7 +206,7 @@ export function App() {
           ].map(({ key, label }) => (
             <button
               key={key}
-              onClick={() => setTab(key)}
+              onClick={() => switchTab(key)}
               class={`px-4 py-1.5 rounded-lg text-sm font-medium transition-colors ${
                 tab === key
                   ? 'bg-gray-700 text-white'

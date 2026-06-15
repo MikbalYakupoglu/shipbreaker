@@ -107,7 +107,11 @@ func (w *Watcher) Run(ctx context.Context) {
 					loopRunning = false
 					loopMu.Unlock()
 				}()
-				w.poll(ctx)
+				// Cancel the poll before the next tick so stalled Docker API
+				// calls don't pile up across intervals.
+				pollCtx, cancel := context.WithTimeout(ctx, w.interval*9/10)
+				defer cancel()
+				w.poll(pollCtx)
 			}()
 		}
 	}

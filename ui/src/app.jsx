@@ -4,10 +4,7 @@ import { Login } from './components/Login.jsx'
 import { ServiceTable } from './components/ServiceTable.jsx'
 import { ContainerList } from './components/ContainerList.jsx'
 
-const POLL_MS      = 30_000  // full analysis + containers (normal)
-const SNAP_MS      = 5_000   // lightweight snapshot (normal)
-const LIVE_POLL_MS = 10_000  // full analysis (live mode)
-const LIVE_SNAP_MS = 1_000   // snapshot (live mode)
+const LIVE_MS = 5_000  // live mode: all polling at 5s
 
 export function App() {
   const [cfg, setCfg] = useState(null)
@@ -54,10 +51,11 @@ export function App() {
   useEffect(() => {
     if (!authed) return
     loadData()
-    const ms = liveMode ? LIVE_POLL_MS : POLL_MS
+    const intervalSec = cfg?.sample_interval_sec ?? 60
+    const ms = liveMode ? LIVE_MS : intervalSec * 1000
     const id = setInterval(loadData, ms)
     return () => clearInterval(id)
-  }, [authed, liveMode])
+  }, [authed, liveMode, cfg])
 
   // Snapshot polling — interval depends on live mode
   useEffect(() => {
@@ -70,10 +68,11 @@ export function App() {
       } catch {}
     }
     loadSnap()
-    const ms = liveMode ? LIVE_SNAP_MS : SNAP_MS
+    const intervalSec = cfg?.sample_interval_sec ?? 60
+    const ms = liveMode ? LIVE_MS : intervalSec * 1000
     const id = setInterval(loadSnap, ms)
     return () => clearInterval(id)
-  }, [authed, liveMode])
+  }, [authed, liveMode, cfg])
 
   async function loadData() {
     try {

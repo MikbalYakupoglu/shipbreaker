@@ -96,8 +96,9 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 // handleConfig — auth-free, non-sensitive settings (Y3)
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]any{
-		"tz":            s.cfg.TZ,
-		"auth_required": s.auth != nil,
+		"tz":                  s.cfg.TZ,
+		"auth_required":       s.auth != nil,
+		"sample_interval_sec": s.cfg.SampleIntervalSec,
 	})
 }
 

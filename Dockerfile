@@ -3,7 +3,7 @@ FROM node:22-alpine AS ui-builder
 
 WORKDIR /app/ui
 COPY ui/package*.json ./
-RUN npm ci
+RUN --mount=type=cache,target=/root/.npm npm ci
 COPY ui/ ./
 RUN npm run build
 
@@ -14,7 +14,7 @@ WORKDIR /app
 
 # Download dependencies first (layer cache)
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
 
 # Copy source
 COPY . .
@@ -23,7 +23,9 @@ COPY . .
 COPY --from=ui-builder /app/ui/dist ./internal/api/dist
 
 # Build — CGO disabled, static binary
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /breaker ./cmd/breaker
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /breaker ./cmd/breaker
 
 # ── Stage 3: Minimal runtime image ───────────────────────────────────────────
 FROM alpine:3.21

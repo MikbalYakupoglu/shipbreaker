@@ -216,9 +216,17 @@ func (w *Watcher) processContainer(ctx context.Context, c container.Summary) {
 		return
 	}
 
-	stats, err := fetchStats(ctx, w.cli, c.ID)
+	// Per-container timeout: a single unresponsive container must not
+	// hold a worker for the entire poll window.
+	statsCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	stats, err := fetchStats(statsCtx, w.cli, c.ID)
 	if err != nil {
-		w.log.Warn("fetch stats failed", "id", shortID(c.ID), "err", err)
+		if ctx.Err() == nil {
+			// Only log if the poll itself wasn't cancelled — avoids
+			// duplicate noise when the poll-level timeout fires.
+			w.log.Warn("fetch stats failed", "id", shortID(c.ID), "err", err)
+		}
 		return
 	}
 

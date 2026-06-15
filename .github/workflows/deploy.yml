@@ -3,7 +3,7 @@ name: Build and Deploy to Dokploy
 on:
   push:
     branches:
-      - production
+      - main
 
 env:
   IMAGE_NAME: ghcr.io/mikbal/shipbreaker

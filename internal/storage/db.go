@@ -11,7 +11,7 @@ import (
 // Open returns a writer DB (single connection) and a reader pool.
 // WAL mode + busy_timeout + foreign keys are configured on both.
 func Open(path string) (writer *sql.DB, reader *sql.DB, err error) {
-	dsn := fmt.Sprintf("file:%s?_journal_mode=WAL&_foreign_keys=on&_auto_vacuum=incremental", path)
+	dsn := fmt.Sprintf("file:%s?_journal_mode=WAL&_foreign_keys=on&_auto_vacuum=incremental&_busy_timeout=5000", path)
 
 	writer, err = sql.Open("sqlite", dsn)
 	if err != nil {
@@ -52,7 +52,6 @@ func Open(path string) (writer *sql.DB, reader *sql.DB, err error) {
 // guarantee DSN-encoded pragmas are applied to every physical connection.
 func applyPragmas(ctx context.Context, db *sql.DB) error {
 	pragmas := []string{
-		"PRAGMA journal_mode=WAL",
 		"PRAGMA busy_timeout=5000",
 		"PRAGMA synchronous=NORMAL",
 		"PRAGMA foreign_keys=ON",

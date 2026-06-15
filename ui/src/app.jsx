@@ -24,6 +24,7 @@ export function App() {
   const zombieReqRef = useRef(false)
   const containerReqRef = useRef(false)
   const [reloading, setReloading] = useState(false)
+  const [reloadCooldown, setReloadCooldown] = useState(false)
   const [liveMode, setLiveMode] = useState(false)
   const [lastUpdated, setLastUpdated] = useState(null)
   const [now, setNow] = useState(new Date())
@@ -119,6 +120,8 @@ export function App() {
 
   async function handleReload() {
     setReloading(true)
+    setReloadCooldown(true)
+    setTimeout(() => setReloadCooldown(false), 3000)
     try {
       await triggerRefresh()
       if (tab === 'zombies') {
@@ -184,10 +187,10 @@ export function App() {
             <span class="text-xs text-gray-600">{cfg?.tz || 'UTC'}</span>
             <button
               onClick={handleReload}
-              disabled={reloading}
+              disabled={reloading || reloadCooldown}
               title="Verileri yenile"
               class={`flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border font-medium transition-colors ${
-                reloading
+                reloading || reloadCooldown
                   ? 'border-gray-700 text-gray-600 cursor-not-allowed'
                   : 'border-gray-700 text-gray-400 hover:text-white hover:border-gray-500'
               }`}

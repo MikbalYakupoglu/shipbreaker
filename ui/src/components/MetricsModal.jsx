@@ -21,10 +21,11 @@ export function MetricsModal({ service, tz, onClose }) {
     [service.service_id]
   )
 
-  const cpuValues  = points?.map(p => p.cpu_avg_pct) ?? []
-  const memValues  = points?.map(p => p.memory_ws_avg_bytes) ?? []
-  const netValues  = points?.map(p => (p.net_rx_bytes + p.net_tx_bytes) / 1024 / 1024) ?? []
-  const timestamps = points?.map(p => p.bucket) ?? []
+  const pts = Array.isArray(points) ? points : []
+  const cpuValues  = pts.map(p => p.cpu_avg_pct)
+  const memValues  = pts.map(p => p.memory_ws_avg_bytes)
+  const netValues  = pts.map(p => (p.net_rx_bytes + p.net_tx_bytes) / 1024 / 1024)
+  const timestamps = pts.map(p => p.bucket)
 
   const charts = [
     {
@@ -67,7 +68,7 @@ export function MetricsModal({ service, tz, onClose }) {
           {loading && <p class="text-gray-400 text-sm">Yükleniyor…</p>}
           {error && <p class="text-red-400 text-sm">Hata: {error.message}</p>}
 
-          {points && (
+          {points != null && (
             <>
               {/* Charts */}
               <div class="flex flex-col gap-4 mb-6">
@@ -86,7 +87,7 @@ export function MetricsModal({ service, tz, onClose }) {
               </div>
 
               {/* Data table */}
-              {points.length === 0 ? (
+              {pts.length === 0 ? (
                 <p class="text-gray-500 text-sm text-center py-4">Henüz metrik yok.</p>
               ) : (
                 <div class="overflow-x-auto">
@@ -102,7 +103,7 @@ export function MetricsModal({ service, tz, onClose }) {
                       </tr>
                     </thead>
                     <tbody>
-                      {[...points].reverse().slice(0, 72).map(p => (
+                      {[...pts].reverse().slice(0, 72).map(p => (
                         <tr key={p.bucket} class="border-b border-gray-800/50 hover:bg-gray-800/30">
                           <td class="py-1.5 pr-4 text-gray-400 font-mono text-xs whitespace-nowrap">
                             {fmtDate(p.bucket, tz)}

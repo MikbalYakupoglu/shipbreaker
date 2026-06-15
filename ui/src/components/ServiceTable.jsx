@@ -20,20 +20,73 @@ function fmtCPU(pct) {
   return `${pct.toFixed(2)}%`
 }
 
-// Dim label for "Yetersiz Veri" rows where we show live snapshot values
 function LiveTag() {
   return (
     <span class="text-xs text-gray-600 ml-1" title="anlık değer">(anlık)</span>
   )
 }
 
+function getSortValue(svc, key) {
+  const L = svc.latest || {}
+  const hasAvg = svc.status !== 'insufficient_data'
+  switch (key) {
+    case 'cpu':
+      return hasAvg ? (svc.cpu_avg_pct ?? -1) : (L.latest_cpu_pct ?? -1)
+    case 'ram':
+      return L.latest_mem_bytes ?? -1
+    case 'net':
+      return hasAvg
+        ? (svc.net_bytes_per_day ?? -1)
+        : ((L.latest_net_rx_bytes ?? 0) + (L.latest_net_tx_bytes ?? 0))
+    case 'disk':
+      return hasAvg
+        ? (svc.disk_bytes_per_day ?? -1)
+        : ((L.latest_blk_read_bytes ?? 0) + (L.latest_blk_write_bytes ?? 0))
+    default:
+      return 0
+  }
+}
+
+function SortHeader({ label, sortKey, currentSort, onSort }) {
+  const active = currentSort.key === sortKey
+  const asc = active && currentSort.asc
+  return (
+    <th
+      class="py-3 px-4 font-medium cursor-pointer select-none hover:text-white transition-colors whitespace-nowrap"
+      onClick={() => onSort(sortKey)}
+    >
+      <span class="inline-flex items-center gap-1">
+        {label}
+        <span class={`text-xs ${active ? 'text-blue-400' : 'text-gray-700'}`}>
+          {active ? (asc ? '▲' : '▼') : '⇅'}
+        </span>
+      </span>
+    </th>
+  )
+}
+
 export function ServiceTable({ services, tz }) {
   const [selected, setSelected] = useState(null)
   const [filter, setFilter] = useState('all')
+  const [sort, setSort] = useState({ key: null, asc: false })
 
-  const filtered = (services || []).filter(s =>
+  const handleSort = (key) => {
+    setSort(prev =>
+      prev.key === key ? { key, asc: !prev.asc } : { key, asc: false }
+    )
+  }
+
+  const baseFiltered = (services || []).filter(s =>
     filter === 'all' ? true : s.status === filter
   )
+
+  const filtered = sort.key
+    ? [...baseFiltered].sort((a, b) => {
+        const va = getSortValue(a, sort.key)
+        const vb = getSortValue(b, sort.key)
+        return sort.asc ? va - vb : vb - va
+      })
+    : baseFiltered
 
   const zombieCount = (services || []).filter(s => s.status === 'zombie').length
   const activeCount = (services || []).filter(s => s.status === 'active').length
@@ -76,10 +129,10 @@ export function ServiceTable({ services, tz }) {
               <tr class="text-gray-500 text-xs uppercase bg-gray-900/50 border-b border-gray-800">
                 <th class="py-3 px-4 font-medium">Durum</th>
                 <th class="py-3 px-4 font-medium">Servis</th>
-                <th class="py-3 px-4 font-medium">CPU</th>
-                <th class="py-3 px-4 font-medium">RAM</th>
-                <th class="py-3 px-4 font-medium">Ağ (rx+tx)</th>
-                <th class="py-3 px-4 font-medium">Disk (r+w)</th>
+                <SortHeader label="CPU"        sortKey="cpu"  currentSort={sort} onSort={handleSort} />
+                <SortHeader label="RAM"        sortKey="ram"  currentSort={sort} onSort={handleSort} />
+                <SortHeader label="Ağ (rx+tx)" sortKey="net"  currentSort={sort} onSort={handleSort} />
+                <SortHeader label="Disk (r+w)" sortKey="disk" currentSort={sort} onSort={handleSort} />
                 <th class="py-3 px-4 font-medium">Örnekler</th>
                 <th class="py-3 px-4 font-medium"></th>
               </tr>
@@ -106,7 +159,7 @@ export function ServiceTable({ services, tz }) {
                       </div>
                     </td>
 
-                    {/* CPU — avg if evaluated, live snapshot if insufficient */}
+                    {/* CPU */}
                     <td class="py-3 px-4">
                       {hasAvg ? (
                         <div>
@@ -123,7 +176,7 @@ export function ServiceTable({ services, tz }) {
                       )}
                     </td>
 
-                    {/* RAM — always from live snapshot */}
+                    {/* RAM */}
                     <td class="py-3 px-4">
                       {hasLive ? (
                         <div>
@@ -194,7 +247,6 @@ export function ServiceTable({ services, tz }) {
         </div>
       )}
 
-      {/* Info bar for insufficient_data explanation */}
       {insuffCount > 0 && filter !== 'zombie' && filter !== 'active' && (
         <p class="text-gray-600 text-xs mt-3">
           Zombi/Aktif kararı için 84 saatlik kova verisi gerekli (~3.5 gün). Anlık değerler mevcut metriklerden alınmaktadır.

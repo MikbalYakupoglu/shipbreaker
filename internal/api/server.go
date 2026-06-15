@@ -278,7 +278,7 @@ func (s *Server) handleServiceMetrics(w http.ResponseWriter, r *http.Request) {
 		BlkWriteDelta int64  `json:"blk_write_bytes"`
 		SampleCount  int     `json:"sample_count"`
 	}
-	var points []point
+	points := []point{}
 	for rows.Next() {
 		var p point
 		var bucket int64

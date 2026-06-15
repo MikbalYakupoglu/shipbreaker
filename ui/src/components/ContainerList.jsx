@@ -19,6 +19,24 @@ function uptime(isoCreated, now) {
   return `${Math.floor(hrs / 24)}gün`
 }
 
+function deduplicateContainers(containers) {
+  const sorted = [...containers].sort((a, b) => {
+    if (a.status === 'running' && b.status !== 'running') return -1
+    if (b.status === 'running' && a.status !== 'running') return 1
+    return 0
+  })
+  const seenImages = new Set()
+  const seenNames = new Set()
+  const result = []
+  for (const c of sorted) {
+    if (seenImages.has(c.image) || seenNames.has(c.name)) continue
+    seenImages.add(c.image)
+    seenNames.add(c.name)
+    result.push(c)
+  }
+  return result
+}
+
 export function ContainerList({ containers, tz }) {
   const [selected, setSelected] = useState(null)
   const [now, setNow] = useState(Date.now())
@@ -29,7 +47,9 @@ export function ContainerList({ containers, tz }) {
     return () => clearInterval(id)
   }, [])
 
-  if (!containers || containers.length === 0) {
+  const unique = deduplicateContainers(containers || [])
+
+  if (unique.length === 0) {
     return <p class="text-gray-500 text-sm text-center py-8">Konteyner bulunamadı.</p>
   }
 
@@ -48,7 +68,7 @@ export function ContainerList({ containers, tz }) {
             </tr>
           </thead>
           <tbody>
-            {containers.map(c => (
+            {unique.map(c => (
               <tr
                 key={c.id}
                 class="border-b border-gray-800/50 hover:bg-gray-800/30 cursor-pointer transition-colors"

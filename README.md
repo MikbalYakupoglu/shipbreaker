@@ -151,7 +151,8 @@ breaker scan [--db /path/to/shipbreaker.db] [--config config.yaml]
 | `SHIPBREAKER_PORT` | Dinleme portu | `7777` |
 | `SHIPBREAKER_DB_PATH` | SQLite veritabanı yolu | `/data/shipbreaker.db` |
 | `SHIPBREAKER_TZ` | Gösterim zaman dilimi | `UTC` |
-| `SHIPBREAKER_SAMPLE_INTERVAL_SEC` | Docker stats örnekleme aralığı (saniye) | `5` |
+| `SHIPBREAKER_SAMPLE_INTERVAL_SEC` | Docker stats örnekleme aralığı (saniye) | `60` |
+| `SHIPBREAKER_LIVE_INTERVAL_SEC` | "Canlı takip" modunda örnekleme aralığı (saniye) | `5` |
 | `SHIPBREAKER_CPU_THRESHOLD_PCT` | Zombie CPU eşiği (çekirdek başı %) | `5.0` |
 | `SHIPBREAKER_NET_THRESHOLD_PER_DAY` | Zombie ağ eşiği (byte/gün) | `1572864` (1.5 MB) |
 | `SHIPBREAKER_DISK_THRESHOLD_PER_DAY` | Zombie disk I/O eşiği (byte/gün) | `7340032` (7 MB) |
@@ -163,7 +164,8 @@ bind: 0.0.0.0
 port: 7777
 db_path: /data/shipbreaker.db
 
-sample_interval_sec: 5    # Docker stats örnekleme aralığı (saniye)
+sample_interval_sec: 60   # Docker stats örnekleme aralığı (saniye)
+live_interval_sec: 5      # "Canlı takip" modunda örnekleme aralığı (saniye)
 window_days: 7
 min_samples: 84          # 7 günün %50'si
 

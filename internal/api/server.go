@@ -15,26 +15,35 @@ import (
 	"github.com/mikbal/shipbreaker/internal/config"
 )
 
+// IntervalSetter can update the watcher's polling interval at runtime.
+type IntervalSetter interface {
+	SetInterval(d time.Duration)
+}
+
 // Server is the HTTP API server.
 type Server struct {
-	router       *chi.Mux
-	db           *sql.DB
-	an           *analyzer.Analyzer
-	auth         *authState // nil if auth disabled
-	rl           *rateLimit
-	trustedCIDRs []*net.IPNet
-	cfg          *config.Config
+	router          *chi.Mux
+	db              *sql.DB
+	an              *analyzer.Analyzer
+	auth            *authState // nil if auth disabled
+	rl              *rateLimit
+	trustedCIDRs    []*net.IPNet
+	cfg             *config.Config
+	watcher         IntervalSetter
+	defaultInterval time.Duration
 }
 
 // New builds and wires up the chi router.
-func New(reader *sql.DB, an *analyzer.Analyzer, cfg *config.Config, auth *authState) *Server {
+func New(reader *sql.DB, an *analyzer.Analyzer, cfg *config.Config, auth *authState, watcher IntervalSetter) *Server {
 	s := &Server{
-		router: chi.NewRouter(),
-		db:     reader,
-		an:     an,
-		auth:   auth,
-		rl:     newRateLimit(),
-		cfg:    cfg,
+		router:          chi.NewRouter(),
+		db:              reader,
+		an:              an,
+		auth:            auth,
+		rl:              newRateLimit(),
+		cfg:             cfg,
+		watcher:         watcher,
+		defaultInterval: time.Duration(cfg.SampleIntervalSec) * time.Second,
 	}
 	if cfg.TrustedProxies != "" {
 		for _, cidr := range splitTrim(cfg.TrustedProxies) {
@@ -84,6 +93,30 @@ func (s *Server) protectedRoutes(r chi.Router) {
 	r.Get("/api/containers", s.handleContainers)
 	r.Get("/api/containers/{id}", s.handleContainer)
 	r.Get("/api/containers/{id}/metrics", s.handleContainerRawMetrics)
+	r.Post("/api/live", s.handleLive)
+}
+
+// handleLive toggles the backend sampling interval between the default and 5 s.
+func (s *Server) handleLive(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	var d time.Duration
+	var intervalSec int
+	if body.Enabled {
+		d = time.Duration(s.cfg.LiveIntervalSec) * time.Second
+		intervalSec = s.cfg.LiveIntervalSec
+	} else {
+		d = s.defaultInterval
+		intervalSec = s.cfg.SampleIntervalSec
+	}
+	s.watcher.SetInterval(d)
+	jsonOK(w, map[string]int{"interval_sec": intervalSec})
 }
 
 // handleHealthz — minimal, auth-free (Y3)
@@ -99,6 +132,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		"tz":                  s.cfg.TZ,
 		"auth_required":       s.auth != nil,
 		"sample_interval_sec": s.cfg.SampleIntervalSec,
+		"live_interval_sec":   s.cfg.LiveIntervalSec,
 	})
 }
 

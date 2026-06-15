@@ -1,10 +1,9 @@
 import { useState, useEffect } from 'preact/hooks'
-import { fetchConfig, fetchZombies, fetchContainers, fetchSnapshot } from './api.js'
+import { fetchConfig, fetchZombies, fetchContainers, fetchSnapshot, setLiveMode as apiSetLiveMode } from './api.js'
 import { Login } from './components/Login.jsx'
 import { ServiceTable } from './components/ServiceTable.jsx'
 import { ContainerList } from './components/ContainerList.jsx'
 
-const LIVE_MS = 5_000  // live mode: all polling at 5s
 
 export function App() {
   const [cfg, setCfg] = useState(null)
@@ -51,8 +50,9 @@ export function App() {
   useEffect(() => {
     if (!authed) return
     loadData()
-    const intervalSec = cfg?.sample_interval_sec ?? 60
-    const ms = liveMode ? LIVE_MS : intervalSec * 1000
+    const liveMs = (cfg?.live_interval_sec ?? 5) * 1000
+    const normalMs = (cfg?.sample_interval_sec ?? 60) * 1000
+    const ms = liveMode ? liveMs : normalMs
     const id = setInterval(loadData, ms)
     return () => clearInterval(id)
   }, [authed, liveMode, cfg])
@@ -68,8 +68,9 @@ export function App() {
       } catch {}
     }
     loadSnap()
-    const intervalSec = cfg?.sample_interval_sec ?? 60
-    const ms = liveMode ? LIVE_MS : intervalSec * 1000
+    const liveMs = (cfg?.live_interval_sec ?? 5) * 1000
+    const normalMs = (cfg?.sample_interval_sec ?? 60) * 1000
+    const ms = liveMode ? liveMs : normalMs
     const id = setInterval(loadSnap, ms)
     return () => clearInterval(id)
   }, [authed, liveMode, cfg])
@@ -136,7 +137,11 @@ export function App() {
           <div class="flex items-center gap-4">
             <label class="flex items-center gap-2 cursor-pointer select-none">
               <div
-                onClick={() => setLiveMode(v => !v)}
+                onClick={() => {
+                  const next = !liveMode
+                  setLiveMode(next)
+                  apiSetLiveMode(next).catch(() => {})
+                }}
                 class={`relative w-9 h-5 rounded-full transition-colors ${liveMode ? 'bg-green-600' : 'bg-gray-700'}`}
               >
                 <span class={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${liveMode ? 'translate-x-4' : 'translate-x-0'}`} />

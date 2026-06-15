@@ -53,3 +53,11 @@ export async function fetchContainer(id) {
 export async function fetchContainerMetrics(id) {
   return apiFetch(`/api/containers/${id}/metrics`)
 }
+
+export async function setLiveMode(enabled) {
+  return apiFetch('/api/live', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  })
+}

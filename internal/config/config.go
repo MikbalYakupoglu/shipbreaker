@@ -29,6 +29,7 @@ type Config struct {
 
 	// Sampling
 	SampleIntervalSec int `yaml:"sample_interval_sec"`
+	LiveIntervalSec   int `yaml:"live_interval_sec"`
 
 	// Heuristic window
 	WindowDays int `yaml:"window_days"`
@@ -51,6 +52,7 @@ func defaults() Config {
 		RawRetentionDays:    3,
 		HourlyRetentionDays: 35,
 		SampleIntervalSec:   60,
+		LiveIntervalSec:     5,
 		WindowDays:          7,
 		MinSamples:          84, // 50% of 168 hourly buckets in 7 days
 		CPUThresholdPct:     5.0,
@@ -99,6 +101,12 @@ func Load(yamlPath string) (*Config, error) {
 		var n int
 		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 0 {
 			cfg.SampleIntervalSec = n
+		}
+	}
+	if v := os.Getenv("SHIPBREAKER_LIVE_INTERVAL_SEC"); v != "" {
+		var n int
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 0 {
+			cfg.LiveIntervalSec = n
 		}
 	}
 	cfg.User = os.Getenv("SHIPBREAKER_USER")

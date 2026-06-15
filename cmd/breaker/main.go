@@ -232,7 +232,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	srv := api.New(reader, an, cfg, authState)
+	srv := api.New(reader, an, cfg, authState, watcher)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

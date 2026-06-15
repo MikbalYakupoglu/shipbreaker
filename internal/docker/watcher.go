@@ -56,23 +56,36 @@ type Sink interface {
 type Watcher struct {
 	cli      *client.Client
 	sink     Sink
-	interval time.Duration
 	log      *slog.Logger
 
-	mu       sync.Mutex
-	prevRead map[string]*container.StatsResponse // containerID → last stats snapshot
-	hostCPUs uint32
+	mu         sync.Mutex
+	interval   time.Duration
+	prevRead   map[string]*container.StatsResponse // containerID → last stats snapshot
+	hostCPUs   uint32
+	intervalCh chan time.Duration
 }
 
 // New creates a Watcher. cli must have been opened with WithAPIVersionNegotiation.
 func New(cli *client.Client, sink Sink, interval time.Duration, log *slog.Logger) *Watcher {
 	return &Watcher{
-		cli:      cli,
-		sink:     sink,
-		interval: interval,
-		log:      log,
-		prevRead: make(map[string]*container.StatsResponse),
+		cli:        cli,
+		sink:       sink,
+		interval:   interval,
+		log:        log,
+		prevRead:   make(map[string]*container.StatsResponse),
+		intervalCh: make(chan time.Duration, 1),
 	}
+}
+
+// SetInterval changes the polling interval at runtime.
+// Safe to call from any goroutine.
+func (w *Watcher) SetInterval(d time.Duration) {
+	// Drain any pending update that hasn't been consumed yet.
+	select {
+	case <-w.intervalCh:
+	default:
+	}
+	w.intervalCh <- d
 }
 
 // Run starts the polling loop and events listener. Blocks until ctx is cancelled.
@@ -81,7 +94,9 @@ func (w *Watcher) Run(ctx context.Context) {
 
 	go w.runEvents(ctx)
 
+	w.mu.Lock()
 	ticker := time.NewTicker(w.interval)
+	w.mu.Unlock()
 	defer ticker.Stop()
 
 	var loopRunning bool
@@ -91,6 +106,11 @@ func (w *Watcher) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
+		case d := <-w.intervalCh:
+			ticker.Reset(d)
+			w.mu.Lock()
+			w.interval = d
+			w.mu.Unlock()
 		case <-ticker.C:
 			loopMu.Lock()
 			if loopRunning {
@@ -101,6 +121,10 @@ func (w *Watcher) Run(ctx context.Context) {
 			loopRunning = true
 			loopMu.Unlock()
 
+			w.mu.Lock()
+			curInterval := w.interval
+			w.mu.Unlock()
+
 			go func() {
 				defer func() {
 					loopMu.Lock()
@@ -109,7 +133,7 @@ func (w *Watcher) Run(ctx context.Context) {
 				}()
 				// Cancel the poll before the next tick so stalled Docker API
 				// calls don't pile up across intervals.
-				pollCtx, cancel := context.WithTimeout(ctx, w.interval*9/10)
+				pollCtx, cancel := context.WithTimeout(ctx, curInterval*9/10)
 				defer cancel()
 				w.poll(pollCtx)
 			}()

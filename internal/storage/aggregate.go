@@ -20,12 +20,11 @@ func NewAggregator(writer, reader *sql.DB, log *slog.Logger) *Aggregator {
 }
 
 // Run processes the current incomplete bucket plus any unprocessed past buckets.
-// Each bucket is committed in its own short transaction (FIX 5 — chunked backfill).
+// Each bucket is committed in one short transaction.
 func (a *Aggregator) Run(ctx context.Context) error {
 	now := time.Now().UTC().Unix()
 	currentBucket := now - (now % 3600)
 
-	// Find the oldest unprocessed bucket in metrics_raw
 	var oldestRaw sql.NullInt64
 	err := a.r.QueryRowContext(ctx, `
 		SELECT MIN(timestamp - (timestamp % 3600)) FROM metrics_raw
@@ -41,136 +40,135 @@ func (a *Aggregator) Run(ctx context.Context) error {
 		if err := a.processBucket(ctx, bucket); err != nil {
 			a.log.Error("aggregate bucket", "bucket", bucket, "err", err)
 		}
-		runtime.Gosched() // yield between buckets
+		runtime.Gosched()
 	}
 	return nil
 }
 
+type aggState struct {
+	cpuSum, memSum        float64
+	cpuMax                float64
+	netRxDelta, netTxDelta int64
+	blkRDelta, blkWDelta  int64
+	count                 int
+	prevRx, prevTx        int64
+	prevBR, prevBW        int64
+}
+
+// processBucket aggregates one hourly bucket using 2 reader queries and 1 writer transaction
+// instead of the previous 3N queries + N transactions pattern.
 func (a *Aggregator) processBucket(ctx context.Context, bucket int64) error {
 	bucketEnd := bucket + 3600
 
-	// Fetch all container_ids that have raw data in this bucket
-	rows, err := a.r.QueryContext(ctx, `
-		SELECT DISTINCT container_id FROM metrics_raw
+	// ── 1. Prev-bucket row per container (batch, for delta continuity) ────────
+	type prevRow struct{ netRx, netTx, blkR, blkW int64 }
+	prevMap := map[string]prevRow{}
+
+	pRows, err := a.r.QueryContext(ctx, `
+		SELECT m.container_id,
+		       m.net_rx_bytes, m.net_tx_bytes, m.blk_read_bytes, m.blk_write_bytes
+		FROM metrics_raw m
+		JOIN (
+		    SELECT container_id, MAX(timestamp) AS ts
+		    FROM metrics_raw
+		    WHERE timestamp < ?
+		    GROUP BY container_id
+		) sub ON m.container_id = sub.container_id AND m.timestamp = sub.ts
+		WHERE m.container_id IN (
+		    SELECT DISTINCT container_id FROM metrics_raw
+		    WHERE timestamp >= ? AND timestamp < ?
+		)
+	`, bucket, bucket, bucketEnd)
+	if err != nil {
+		return err
+	}
+	for pRows.Next() {
+		var cid string
+		var p prevRow
+		if err := pRows.Scan(&cid, &p.netRx, &p.netTx, &p.blkR, &p.blkW); err != nil {
+			pRows.Close()
+			return err
+		}
+		prevMap[cid] = p
+	}
+	pRows.Close()
+	if err := pRows.Err(); err != nil {
+		return err
+	}
+
+	// ── 2. All raw rows for this bucket, ordered for delta computation ─────────
+	aggMap := map[string]*aggState{}
+
+	dRows, err := a.r.QueryContext(ctx, `
+		SELECT container_id, cpu_percent, memory_ws_bytes,
+		       net_rx_bytes, net_tx_bytes, blk_read_bytes, blk_write_bytes
+		FROM metrics_raw
 		WHERE timestamp >= ? AND timestamp < ?
+		ORDER BY container_id, timestamp ASC
 	`, bucket, bucketEnd)
 	if err != nil {
 		return err
 	}
-	var containerIDs []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
+	for dRows.Next() {
+		var cid string
+		var cpu float64
+		var memWS, netRx, netTx, blkR, blkW int64
+		if err := dRows.Scan(&cid, &cpu, &memWS, &netRx, &netTx, &blkR, &blkW); err != nil {
+			dRows.Close()
 			return err
 		}
-		containerIDs = append(containerIDs, id)
-	}
-	rows.Close()
-
-	for _, cid := range containerIDs {
-		if err := a.upsertHourlyBucket(ctx, cid, bucket, bucketEnd); err != nil {
-			a.log.Warn("upsert hourly bucket", "container", cid[:min12(cid)], "bucket", bucket, "err", err)
+		s, ok := aggMap[cid]
+		if !ok {
+			p := prevMap[cid]
+			s = &aggState{prevRx: p.netRx, prevTx: p.netTx, prevBR: p.blkR, prevBW: p.blkW}
+			aggMap[cid] = s
 		}
-	}
-	return nil
-}
-
-func (a *Aggregator) upsertHourlyBucket(ctx context.Context, containerID string, bucket, bucketEnd int64) error {
-	// Fetch prev bucket's last raw values for delta continuity (kovalar arası süreklilik)
-	var prevNetRx, prevNetTx, prevBlkR, prevBlkW int64
-	err := a.r.QueryRowContext(ctx, `
-		SELECT net_rx_bytes, net_tx_bytes, blk_read_bytes, blk_write_bytes
-		FROM metrics_raw
-		WHERE container_id = ? AND timestamp < ?
-		ORDER BY timestamp DESC LIMIT 1
-	`, containerID, bucket).Scan(&prevNetRx, &prevNetTx, &prevBlkR, &prevBlkW)
-	// no prev row → err (sql.ErrNoRows) → deltas start from 0, that's fine
-
-	type rawRow struct {
-		ts      int64
-		cpu     float64
-		memWS   int64
-		netRx   int64
-		netTx   int64
-		blkR    int64
-		blkW    int64
-	}
-
-	rows, err2 := a.r.QueryContext(ctx, `
-		SELECT timestamp, cpu_percent, memory_ws_bytes,
-		       net_rx_bytes, net_tx_bytes, blk_read_bytes, blk_write_bytes
-		FROM metrics_raw
-		WHERE container_id = ? AND timestamp >= ? AND timestamp < ?
-		ORDER BY timestamp ASC
-	`, containerID, bucket, bucketEnd)
-	if err2 != nil {
-		return err2
-	}
-	_ = err // prev lookup error is non-fatal
-
-	var samples []rawRow
-	for rows.Next() {
-		var r rawRow
-		if err := rows.Scan(&r.ts, &r.cpu, &r.memWS, &r.netRx, &r.netTx, &r.blkR, &r.blkW); err != nil {
-			rows.Close()
-			return err
+		s.cpuSum += cpu
+		if cpu > s.cpuMax {
+			s.cpuMax = cpu
 		}
-		samples = append(samples, r)
-	}
-	rows.Close()
+		s.memSum += float64(memWS)
+		s.count++
 
-	if len(samples) == 0 {
+		if netRx >= s.prevRx {
+			s.netRxDelta += netRx - s.prevRx
+		} else {
+			s.netRxDelta += netRx
+		}
+		if netTx >= s.prevTx {
+			s.netTxDelta += netTx - s.prevTx
+		} else {
+			s.netTxDelta += netTx
+		}
+		if blkR >= s.prevBR {
+			s.blkRDelta += blkR - s.prevBR
+		} else {
+			s.blkRDelta += blkR
+		}
+		if blkW >= s.prevBW {
+			s.blkWDelta += blkW - s.prevBW
+		} else {
+			s.blkWDelta += blkW
+		}
+		s.prevRx, s.prevTx, s.prevBR, s.prevBW = netRx, netTx, blkR, blkW
+	}
+	dRows.Close()
+	if err := dRows.Err(); err != nil {
+		return err
+	}
+
+	if len(aggMap) == 0 {
 		return nil
 	}
 
-	// Compute aggregates
-	var cpuSum, memSum float64
-	var cpuMax float64
-	var netRxDelta, netTxDelta, blkRDelta, blkWDelta int64
-
-	prevRx, prevTx, prevBR, prevBW := prevNetRx, prevNetTx, prevBlkR, prevBlkW
-
-	for _, s := range samples {
-		cpuSum += s.cpu
-		if s.cpu > cpuMax {
-			cpuMax = s.cpu
-		}
-		memSum += float64(s.memWS)
-
-		// reset-protected deltas
-		if s.netRx >= prevRx {
-			netRxDelta += s.netRx - prevRx
-		} else {
-			netRxDelta += s.netRx
-		}
-		if s.netTx >= prevTx {
-			netTxDelta += s.netTx - prevTx
-		} else {
-			netTxDelta += s.netTx
-		}
-		if s.blkR >= prevBR {
-			blkRDelta += s.blkR - prevBR
-		} else {
-			blkRDelta += s.blkR
-		}
-		if s.blkW >= prevBW {
-			blkWDelta += s.blkW - prevBW
-		} else {
-			blkWDelta += s.blkW
-		}
-
-		prevRx = s.netRx
-		prevTx = s.netTx
-		prevBR = s.blkR
-		prevBW = s.blkW
+	// ── 3. Write all hourly rows in ONE transaction ───────────────────────────
+	tx, err := a.w.BeginTx(ctx, nil)
+	if err != nil {
+		return err
 	}
+	defer tx.Rollback()
 
-	n := len(samples)
-	cpuAvg := cpuSum / float64(n)
-	memAvg := int64(memSum / float64(n))
-
-	_, err = a.w.ExecContext(ctx, `
+	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO metrics_hourly
 			(container_id, bucket, cpu_percent_avg, cpu_percent_max,
 			 memory_ws_avg, net_rx_delta, net_tx_delta,
@@ -185,14 +183,22 @@ func (a *Aggregator) upsertHourlyBucket(ctx context.Context, containerID string,
 			blk_read_delta   = excluded.blk_read_delta,
 			blk_write_delta  = excluded.blk_write_delta,
 			sample_count     = excluded.sample_count
-	`, containerID, bucket, cpuAvg, cpuMax, memAvg,
-		netRxDelta, netTxDelta, blkRDelta, blkWDelta, n)
-	return err
-}
-
-func min12(id string) int {
-	if len(id) > 12 {
-		return 12
+	`)
+	if err != nil {
+		return err
 	}
-	return len(id)
+	defer stmt.Close()
+
+	for cid, s := range aggMap {
+		cpuAvg := s.cpuSum / float64(s.count)
+		memAvg := int64(s.memSum / float64(s.count))
+		if _, err := stmt.ExecContext(ctx, cid, bucket,
+			cpuAvg, s.cpuMax, memAvg,
+			s.netRxDelta, s.netTxDelta, s.blkRDelta, s.blkWDelta,
+			s.count); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
 }

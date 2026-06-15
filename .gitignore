@@ -1,8 +1,8 @@
 # Claude Code
 .claude/
 
-# Compiled binary
-breaker
+# Compiled binary (root-level only)
+/breaker
 
 # UI build output and dependencies
 ui/dist/

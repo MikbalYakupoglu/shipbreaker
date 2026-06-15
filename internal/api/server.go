@@ -16,9 +16,11 @@ import (
 	"github.com/mikbal/shipbreaker/internal/config"
 )
 
-// IntervalSetter can update the watcher's polling interval at runtime.
+// IntervalSetter can update the watcher's polling interval at runtime
+// and trigger an immediate poll on demand.
 type IntervalSetter interface {
 	SetInterval(d time.Duration)
+	ForcePoll(ctx context.Context) error
 }
 
 // Server is the HTTP API server.
@@ -97,6 +99,7 @@ func (s *Server) protectedRoutes(r chi.Router) {
 	r.Get("/api/containers/{id}", s.handleContainer)
 	r.Get("/api/containers/{id}/metrics", s.handleContainerRawMetrics)
 	r.Post("/api/live", s.handleLive)
+	r.Post("/api/refresh", s.handleRefresh)
 }
 
 // handleLive toggles the backend sampling interval between the default and 5 s.
@@ -120,6 +123,17 @@ func (s *Server) handleLive(w http.ResponseWriter, r *http.Request) {
 	}
 	s.watcher.SetInterval(d)
 	jsonOK(w, map[string]int{"interval_sec": intervalSec})
+}
+
+// handleRefresh triggers an immediate poll and waits for it to complete.
+func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	if err := s.watcher.ForcePoll(ctx); err != nil {
+		http.Error(w, "refresh timeout", http.StatusGatewayTimeout)
+		return
+	}
+	jsonOK(w, map[string]string{"status": "ok"})
 }
 
 // handleHealthz — minimal, auth-free (Y3)

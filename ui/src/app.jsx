@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'preact/hooks'
-import { fetchConfig, fetchZombies, fetchContainers, fetchSnapshot, setLiveMode as apiSetLiveMode } from './api.js'
+import { fetchConfig, fetchZombies, fetchContainers, fetchSnapshot, setLiveMode as apiSetLiveMode, triggerRefresh } from './api.js'
 import { Login } from './components/Login.jsx'
 import { ServiceTable } from './components/ServiceTable.jsx'
 import { ContainerList } from './components/ContainerList.jsx'
@@ -120,6 +120,7 @@ export function App() {
   async function handleReload() {
     setReloading(true)
     try {
+      await triggerRefresh()
       if (tab === 'zombies') {
         const [z, snap] = await Promise.all([fetchZombies(), fetchSnapshot()])
         setZombies(z)

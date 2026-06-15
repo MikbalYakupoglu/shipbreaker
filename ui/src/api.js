@@ -61,3 +61,7 @@ export async function setLiveMode(enabled) {
     body: JSON.stringify({ enabled }),
   })
 }
+
+export async function triggerRefresh() {
+  return apiFetch('/api/refresh', { method: 'POST' })
+}

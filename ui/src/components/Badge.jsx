@@ -9,7 +9,7 @@ export function StatusBadge({ status }) {
   }
   const { label, cls } = map[status] ?? { label: status, cls: 'bg-gray-700 text-gray-300 border-gray-600' }
   return (
-    <span class={`inline-block text-xs px-2 py-0.5 rounded-full border font-medium ${cls}`}>
+    <span class={`inline-block text-xs px-2 py-0.5 rounded-full border font-medium whitespace-nowrap ${cls}`}>
       {label}
     </span>
   )

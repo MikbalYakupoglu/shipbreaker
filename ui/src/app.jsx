@@ -4,8 +4,10 @@ import { Login } from './components/Login.jsx'
 import { ServiceTable } from './components/ServiceTable.jsx'
 import { ContainerList } from './components/ContainerList.jsx'
 
-const POLL_MS = 30_000  // full analysis + containers
-const SNAP_MS = 5_000   // lightweight latest-metrics snapshot
+const POLL_MS      = 30_000  // full analysis + containers (normal)
+const SNAP_MS      = 5_000   // lightweight snapshot (normal)
+const LIVE_POLL_MS = 10_000  // full analysis (live mode)
+const LIVE_SNAP_MS = 1_000   // snapshot (live mode)
 
 export function App() {
   const [cfg, setCfg] = useState(null)
@@ -16,6 +18,8 @@ export function App() {
   const [containers, setContainers] = useState(null)
   const [snapshots, setSnapshots] = useState({})
   const [loading, setLoading] = useState(true)
+  const [reloading, setReloading] = useState(false)
+  const [liveMode, setLiveMode] = useState(false)
   const [lastUpdated, setLastUpdated] = useState(null)
   const [now, setNow] = useState(new Date())
 
@@ -46,15 +50,16 @@ export function App() {
     return () => clearInterval(id)
   }, [])
 
-  // Full data reload every 30s (analysis + containers)
+  // Full data reload — interval depends on live mode
   useEffect(() => {
     if (!authed) return
     loadData()
-    const id = setInterval(loadData, POLL_MS)
+    const ms = liveMode ? LIVE_POLL_MS : POLL_MS
+    const id = setInterval(loadData, ms)
     return () => clearInterval(id)
-  }, [authed])
+  }, [authed, liveMode])
 
-  // Fast snapshot polling every 5s (just latest metrics, no analyzer)
+  // Snapshot polling — interval depends on live mode
   useEffect(() => {
     if (!authed) return
     const loadSnap = async () => {
@@ -65,9 +70,10 @@ export function App() {
       } catch {}
     }
     loadSnap()
-    const id = setInterval(loadSnap, SNAP_MS)
+    const ms = liveMode ? LIVE_SNAP_MS : SNAP_MS
+    const id = setInterval(loadSnap, ms)
     return () => clearInterval(id)
-  }, [authed])
+  }, [authed, liveMode])
 
   async function loadData() {
     try {
@@ -82,6 +88,24 @@ export function App() {
         setAuthed(false)
       }
       setLoading(false)
+    }
+  }
+
+  async function handleReload() {
+    setReloading(true)
+    try {
+      const [z, c, snap] = await Promise.all([fetchZombies(), fetchContainers(), fetchSnapshot()])
+      setZombies(z)
+      setContainers(c)
+      setSnapshots(snap)
+      setLastUpdated(new Date())
+    } catch (err) {
+      if (err.status === 401) {
+        setNeedLogin(true)
+        setAuthed(false)
+      }
+    } finally {
+      setReloading(false)
     }
   }
 
@@ -111,10 +135,34 @@ export function App() {
             )}
           </div>
           <div class="flex items-center gap-4">
+            <label class="flex items-center gap-2 cursor-pointer select-none">
+              <div
+                onClick={() => setLiveMode(v => !v)}
+                class={`relative w-9 h-5 rounded-full transition-colors ${liveMode ? 'bg-green-600' : 'bg-gray-700'}`}
+              >
+                <span class={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${liveMode ? 'translate-x-4' : 'translate-x-0'}`} />
+              </div>
+              <span class={`text-xs font-medium ${liveMode ? 'text-green-400' : 'text-gray-500'}`}>
+                {liveMode ? 'Canlı' : 'Canlı takip'}
+              </span>
+            </label>
             <span class="text-gray-500 text-xs" title="Son metrik güncellemesi">
               {now.toLocaleTimeString('tr-TR', { hour12: false })}
             </span>
             <span class="text-xs text-gray-600">{cfg?.tz || 'UTC'}</span>
+            <button
+              onClick={handleReload}
+              disabled={reloading}
+              title="Verileri yenile"
+              class={`flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border font-medium transition-colors ${
+                reloading
+                  ? 'border-gray-700 text-gray-600 cursor-not-allowed'
+                  : 'border-gray-700 text-gray-400 hover:text-white hover:border-gray-500'
+              }`}
+            >
+              <span class={reloading ? 'animate-spin inline-block' : 'inline-block'}>↻</span>
+              {reloading ? 'Yükleniyor…' : 'Yenile'}
+            </button>
           </div>
         </div>
       </header>

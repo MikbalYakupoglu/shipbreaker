@@ -60,6 +60,37 @@ docker run -d \
   ghcr.io/mikbal/shipbreaker:latest
 ```
 
+### Dokploy
+
+Dokploy'da **Application** tipi olarak deploy edilirken aşağıdaki ayarların yapılandırılması gerekir.
+
+**Environment**
+
+```
+SHIPBREAKER_USER=admin
+SHIPBREAKER_PASSWORD=s3cr3t
+SHIPBREAKER_SESSION_SECRET=rastgele_uzun_bir_string
+SHIPBREAKER_DB_PATH=/data/shipbreaker.db
+```
+
+**Volumes / Mounts**
+
+Docker socket için **Bind Mount**:
+
+| Alan | Değer |
+|---|---|
+| Host Path | `/var/run/docker.sock` |
+| Mount Path | `/var/run/docker.sock` |
+
+Veritabanı kalıcılığı için **Volume Mount**:
+
+| Alan | Değer |
+|---|---|
+| Volume Name | `shipbreaker_data` |
+| Mount Path | `/data` |
+
+> Docker socket mount edilmezse uygulama başlar fakat konteynerlere ulaşamaz.
+
 ### Kaynaktan Derleme
 
 Go 1.25+ ve Node 22+ gereklidir.

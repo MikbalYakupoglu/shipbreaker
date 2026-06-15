@@ -95,6 +95,12 @@ func Load(yamlPath string) (*Config, error) {
 	} else {
 		cfg.TZ = v
 	}
+	if v := os.Getenv("SHIPBREAKER_SAMPLE_INTERVAL_SEC"); v != "" {
+		var n int
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 0 {
+			cfg.SampleIntervalSec = n
+		}
+	}
 	cfg.User = os.Getenv("SHIPBREAKER_USER")
 	cfg.Password = os.Getenv("SHIPBREAKER_PASSWORD")
 	cfg.SessionSecret = os.Getenv("SHIPBREAKER_SESSION_SECRET")

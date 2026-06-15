@@ -6,7 +6,7 @@ on:
       - main
 
 env:
-  IMAGE_NAME: ghcr.io/mikbal/shipbreaker
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/shipbreaker
 
 jobs:
   build-and-push:

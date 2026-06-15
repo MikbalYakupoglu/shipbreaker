@@ -1,0 +1,29 @@
+# Claude Code
+.claude/
+
+# Compiled binary
+breaker
+
+# UI build output and dependencies
+ui/dist/
+ui/node_modules/
+internal/api/dist/
+
+# SQLite databases (may contain runtime data)
+*.db
+*.db-shm
+*.db-wal
+
+# Config files with potential secrets
+config.yaml
+config.yml
+.env
+.env.*
+
+# macOS
+.DS_Store
+
+# Go test cache / coverage
+*.test
+*.out
+coverage.html

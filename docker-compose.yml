@@ -1,0 +1,26 @@
+services:
+  shipbreaker:
+    build: .
+    image: shipbreaker:latest
+    container_name: shipbreaker
+    restart: unless-stopped
+    ports:
+      - "7777:7777"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - shipbreaker_data:/data
+    environment:
+      # Required when binding to non-loopback (set these in .env or Docker secrets)
+      SHIPBREAKER_USER: ${SHIPBREAKER_USER:-admin}
+      SHIPBREAKER_PASSWORD: ${SHIPBREAKER_PASSWORD:-adminpassword}
+      # Optional
+      SHIPBREAKER_SESSION_SECRET: ${SHIPBREAKER_SESSION_SECRET:-}
+      SHIPBREAKER_DB_PATH: /data/shipbreaker.db
+      SHIPBREAKER_TZ: ${SHIPBREAKER_TZ:-UTC}
+      # Uncomment to configure thresholds:
+      # SHIPBREAKER_CPU_THRESHOLD_PCT: "5.0"
+      # SHIPBREAKER_NET_THRESHOLD_PER_DAY: "1572864"   # 1.5 MB
+      # SHIPBREAKER_DISK_THRESHOLD_PER_DAY: "7340032"  # 7 MB
+
+volumes:
+  shipbreaker_data:
